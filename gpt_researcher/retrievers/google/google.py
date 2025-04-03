@@ -4,27 +4,27 @@
 import os
 import requests
 import json
-from tavily import TavilyClient
 
 
 class GoogleSearch:
     """
-    Tavily API Retriever
+    Google API Retriever
     """
-    def __init__(self, query):
+    def __init__(self, query, headers=None, query_domains=None):
         """
-        Initializes the TavilySearch object
+        Initializes the GoogleSearch object
         Args:
             query:
         """
         self.query = query
-        self.api_key = self.get_api_key() #GOOGLE_API_KEY
-        self.cx_key = self.get_cx_key() #GOOGLE_CX_KEY
-        self.client = TavilyClient(self.api_key)
+        self.headers = headers or {}
+        self.query_domains = query_domains or None
+        self.api_key = self.headers.get("google_api_key") or self.get_api_key()  # Use the passed api_key or fallback to environment variable
+        self.cx_key = self.headers.get("google_cx_key") or self.get_cx_key()  # Use the passed cx_key or fallback to environment variable
 
     def get_api_key(self):
         """
-        Gets the Tavily API key
+        Gets the Google API key
         Returns:
 
         """
@@ -38,7 +38,7 @@ class GoogleSearch:
 
     def get_cx_key(self):
         """
-        Gets the Tavily API key
+        Gets the Google CX key
         Returns:
 
         """
@@ -52,14 +52,23 @@ class GoogleSearch:
 
     def search(self, max_results=7):
         """
-        Searches the query
+        Searches the query using Google Custom Search API, optionally restricting to specific domains
         Returns:
-
+            list: List of search results with title, href and body
         """
-        """Useful for general internet search queries using the Google API."""
-        print("Searching with query {0}...".format(self.query))
-        url = f"https://www.googleapis.com/customsearch/v1?key={self.api_key}&cx={self.cx_key}&q={self.query}&start=1"
+        # Build query with domain restrictions if specified
+        search_query = self.query
+        if self.query_domains and len(self.query_domains) > 0:
+            domain_query = " OR ".join([f"site:{domain}" for domain in self.query_domains])
+            search_query = f"({domain_query}) {self.query}"
+
+        print("Searching with query {0}...".format(search_query))
+
+        url = f"https://www.googleapis.com/customsearch/v1?key={self.api_key}&cx={self.cx_key}&q={search_query}&start=1"
         resp = requests.get(url)
+
+        if resp.status_code < 200 or resp.status_code >= 300:
+            print("Google search: unexpected response status: ", resp.status_code)
 
         if resp is None:
             return
@@ -78,11 +87,14 @@ class GoogleSearch:
             # skip youtube results
             if "youtube.com" in result["link"]:
                 continue
-            search_result = {
-                "title": result["title"],
-                "href": result["link"],
-                "body": result["snippet"],
-            }
+            try:
+                search_result = {
+                    "title": result["title"],
+                    "href": result["link"],
+                    "body": result["snippet"],
+                }
+            except:
+                continue
             search_results.append(search_result)
 
-        return search_results
+        return search_results[:max_results]

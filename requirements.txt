@@ -1,24 +1,35 @@
 # dependencies
-asyncio
 beautifulsoup4
 colorama
-duckduckgo_search
 md2pdf
-playwright
-openai
 python-dotenv
 pyyaml
-selenium
-webdriver-manager
 uvicorn
 pydantic
 fastapi
 python-multipart
 markdown
 langchain
-tavily-python
+langchain_community
+langchain-openai
+tiktoken
+gpt-researcher
 arxiv
 PyMuPDF
 requests
 jinja2
 aiofiles
+mistune
+python-docx
+htmldocx
+lxml_html_clean
+websockets
+unstructured
+json_repair
+json5
+loguru
+langgraph
+
+# uncomment for testing
+# pytest
+# pytest-asyncio

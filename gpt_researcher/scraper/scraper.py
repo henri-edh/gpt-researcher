@@ -1,16 +1,32 @@
-from concurrent.futures.thread import ThreadPoolExecutor
-from langchain.document_loaders import PyMuPDFLoader
-from langchain.retrievers import ArxivRetriever
-from functools import partial
+import asyncio
+from colorama import Fore, init
+
 import requests
-from bs4 import BeautifulSoup
+import subprocess
+import sys
+import importlib
+import logging
+
+from gpt_researcher.utils.workers import WorkerPool
+
+from . import (
+    ArxivScraper,
+    BeautifulSoupScraper,
+    PyMuPDFScraper,
+    WebBaseLoaderScraper,
+    BrowserScraper,
+    NoDriverScraper,
+    TavilyExtract,
+    FireCrawl,
+)
 
 
 class Scraper:
     """
     Scraper class to extract the content from the links
     """
-    def __init__(self, urls, user_agent):
+
+    def __init__(self, urls, user_agent, scraper, worker_pool: WorkerPool):
         """
         Initialize the Scraper class.
         Args:
@@ -18,91 +34,161 @@ class Scraper:
         """
         self.urls = urls
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": user_agent
-        })
+        self.session.headers.update({"User-Agent": user_agent})
+        self.scraper = scraper
+        if self.scraper == "tavily_extract":
+            self._check_pkg(self.scraper)
+        if self.scraper == "firecrawl":
+            self._check_pkg(self.scraper)
+        self.logger = logging.getLogger(__name__)
+        self.worker_pool = worker_pool
 
-    def run(self):
+    async def run(self):
         """
         Extracts the content from the links
         """
-        partial_extract = partial(self.extract_data_from_link, session=self.session)
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            contents = executor.map(partial_extract, self.urls)
-        res = [content for content in contents if content['raw_content'] is not None]
+        contents = await asyncio.gather(
+            *(self.extract_data_from_url(url, self.session) for url in self.urls)
+        )
+
+        res = [content for content in contents if content["raw_content"] is not None]
         return res
 
-    def extract_data_from_link(self, link, session):
+    def _check_pkg(self, scrapper_name: str) -> None:
         """
-        Extracts the data from the link
+        Checks and ensures required Python packages are available for scrapers that need
+        dependencies beyond requirements.txt. When adding a new scraper to the repo, update `pkg_map`
+        with its required information and call check_pkg() during initialization.
         """
-        content = ""
-        try:
-            if link.endswith(".pdf"):
-                content = self.scrape_pdf_with_pymupdf(link)
-            elif "arxiv.org" in link:
-                doc_num = link.split("/")[-1]
-                content = self.scrape_pdf_with_arxiv(doc_num)
-            elif link:
-                content = self.scrape_text_with_bs(link, session)
+        pkg_map = {
+            "tavily_extract": {
+                "package_installation_name": "tavily-python",
+                "import_name": "tavily",
+            },
+            "firecrawl": {
+                "package_installation_name": "firecrawl-py",
+                "import_name": "firecrawl",
+            },
+        }
+        pkg = pkg_map[scrapper_name]
+        if not importlib.util.find_spec(pkg["import_name"]):
+            pkg_inst_name = pkg["package_installation_name"]
+            init(autoreset=True)
+            print(Fore.YELLOW + f"{pkg_inst_name} not found. Attempting to install...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg_inst_name]
+                )
+                print(Fore.GREEN + f"{pkg_inst_name} installed successfully.")
+            except subprocess.CalledProcessError:
+                raise ImportError(
+                    Fore.RED
+                    + f"Unable to install {pkg_inst_name}. Please install manually with "
+                    f"`pip install -U {pkg_inst_name}`"
+                )
 
-            if len(content) < 100:
-                return {'url': link, 'raw_content': None}
-            return {'url': link, 'raw_content': content}
-        except Exception as e:
-            return {'url': link, 'raw_content': None}
+    async def extract_data_from_url(self, link, session):
+        """
+        Extracts the data from the link with logging
+        """
+        async with self.worker_pool.throttle():
+            try:
+                Scraper = self.get_scraper(link)
+                scraper = Scraper(link, session)
 
-    def scrape_text_with_bs(self, link, session):
-        response = session.get(link, timeout=4)
-        soup = BeautifulSoup(response.content, 'lxml', from_encoding=response.encoding)
+                # Get scraper name
+                scraper_name = scraper.__class__.__name__
+                self.logger.info(f"\n=== Using {scraper_name} ===")
 
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.extract()
+                # Get content
+                if hasattr(scraper, "scrape_async"):
+                    content, image_urls, title = await scraper.scrape_async()
+                else:
+                    (
+                        content,
+                        image_urls,
+                        title,
+                    ) = await asyncio.get_running_loop().run_in_executor(
+                        self.worker_pool.executor, scraper.scrape
+                    )
 
-        raw_content = self.get_content_from_url(soup)
-        lines = (line.strip() for line in raw_content.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        content = "\n".join(chunk for chunk in chunks if chunk)
-        return content
+                if len(content) < 100:
+                    self.logger.warning(f"Content too short or empty for {link}")
+                    return {
+                        "url": link,
+                        "raw_content": None,
+                        "image_urls": [],
+                        "title": title,
+                    }
 
-    def scrape_pdf_with_pymupdf(self, url) -> str:
-        """Scrape a pdf with pymupdf
+                # Log results
+                self.logger.info(f"\nTitle: {title}")
+                self.logger.info(
+                    f"Content length: {len(content) if content else 0} characters"
+                )
+                self.logger.info(f"Number of images: {len(image_urls)}")
+                self.logger.info(f"URL: {link}")
+                self.logger.info("=" * 50)
+
+                if not content or len(content) < 100:
+                    self.logger.warning(f"Content too short or empty for {link}")
+                    return {
+                        "url": link,
+                        "raw_content": None,
+                        "image_urls": [],
+                        "title": title,
+                    }
+
+                return {
+                    "url": link,
+                    "raw_content": content,
+                    "image_urls": image_urls,
+                    "title": title,
+                }
+
+            except Exception as e:
+                self.logger.error(f"Error processing {link}: {str(e)}")
+                return {"url": link, "raw_content": None, "image_urls": [], "title": ""}
+
+    def get_scraper(self, link):
+        """
+        The function `get_scraper` determines the appropriate scraper class based on the provided link
+        or a default scraper if none matches.
 
         Args:
-            url (str): The url of the pdf to scrape
+          link: The `get_scraper` method takes a `link` parameter which is a URL link to a webpage or a
+        PDF file. Based on the type of content the link points to, the method determines the appropriate
+        scraper class to use for extracting data from that content.
 
         Returns:
-            str: The text scraped from the pdf
+          The `get_scraper` method returns the scraper class based on the provided link. The method
+        checks the link to determine the appropriate scraper class to use based on predefined mappings
+        in the `SCRAPER_CLASSES` dictionary. If the link ends with ".pdf", it selects the
+        `PyMuPDFScraper` class. If the link contains "arxiv.org", it selects the `ArxivScraper
         """
-        loader = PyMuPDFLoader(url)
-        doc = loader.load()
-        return str(doc)
 
-    def scrape_pdf_with_arxiv(self, query) -> str:
-        """Scrape a pdf with arxiv
-        default document length of 70000 about ~15 pages or None for no limit
+        SCRAPER_CLASSES = {
+            "pdf": PyMuPDFScraper,
+            "arxiv": ArxivScraper,
+            "bs": BeautifulSoupScraper,
+            "web_base_loader": WebBaseLoaderScraper,
+            "browser": BrowserScraper,
+            "nodriver": NoDriverScraper,
+            "tavily_extract": TavilyExtract,
+            "firecrawl": FireCrawl,
+        }
 
-        Args:
-            query (str): The query to search for
+        scraper_key = None
 
-        Returns:
-            str: The text scraped from the pdf
-        """
-        retriever = ArxivRetriever(load_max_docs=2, doc_content_chars_max=None)
-        docs = retriever.get_relevant_documents(query=query)
-        return docs[0].page_content
+        if link.endswith(".pdf"):
+            scraper_key = "pdf"
+        elif "arxiv.org" in link:
+            scraper_key = "arxiv"
+        else:
+            scraper_key = self.scraper
 
-    def get_content_from_url(self, soup):
-        """Get the text from the soup
+        scraper_class = SCRAPER_CLASSES.get(scraper_key)
+        if scraper_class is None:
+            raise Exception("Scraper not found.")
 
-        Args:
-            soup (BeautifulSoup): The soup to get the text from
-
-        Returns:
-            str: The text from the soup
-        """
-        text = ""
-        tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5']
-        for element in soup.find_all(tags):  # Find all the <p> elements
-            text += element.text + "\n"
-        return text
+        return scraper_class
